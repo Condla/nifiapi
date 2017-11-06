@@ -94,11 +94,13 @@ class NifiConnection(object):
 
     def change_state(self, url, state, forbidden_initial_state=None):
         request_dict = self.get_state(url)
+
         if forbidden_initial_state and request_dict["component"]["state"] == forbidden_initial_state:
             logger.info("Can't change from {} to {} in this request. Method does not support this!".format(forbidden_initial_state, state))
         else:
             request_dict["component"]["state"] = state
-            response = self._post(url, data = json.dumps(request_dict))
+
+            response = self._put(url, data = json.dumps(request_dict))
             logger.info(response.status_code)
             if not response.status_code == 200:
                 print(response.text)
@@ -145,7 +147,7 @@ class NifiComponent(object):
         return self.nifi_connection.get_min_info(self.url)
 
 
-class Flow(NifiComponent):
+class FlowProcessGroup(NifiComponent):
 
     component_type = "Flow"
 
@@ -165,8 +167,23 @@ class Flow(NifiComponent):
             ControllerService(self.nifi_connection, controller_service_id)
             for controller_service_id in controller_service_ids
         ]
+        logger.info("{} controllers found".format(len(controller_services)))
         return controller_services
 
+    def get_controller_service_by_name(self, name):
+        controller_services = self.get_controller_services()
+        controller_service = None
+        for cs in controller_services:
+            if cs.get_name() == name:
+                controller_service = cs
+                logger.info("found controller with name {}".format(name))
+        return controller_service
+
+    def start(self):
+        logger.info("starting {}".format(self))
+        url = self.url
+        data = '{"id": "' + self.component_id + '", "state": "RUNNING"}'
+        return self.nifi_connection._put(url, data)
 
 class ProcessGroup(NifiComponent):
 
@@ -176,20 +193,23 @@ class ProcessGroup(NifiComponent):
         NifiComponent.__init__(self, nifi_connection, process_group_id)
         self.endpoints['upload_template'] = "templates/upload"
         self.endpoints['initialize_template'] = "template-instance"
+        self.endpoints['controller-services'] = "controller-services"
 
     def upload_template(self, template_path):
         url = self.url + self.endpoints['upload_template']
         files = [('template', (basename(template_path), open(template_path, 'rb'), 'text/xml'))]
         response = self.nifi_connection._upload(url, files)
         template_id = re.findall('<id>(.*)</id>', response.text)[0]
-        return template_id
+        return Template(self.nifi_connection, template_id)
 
-    def initialize_template(self, template_id, origin_x=0, origin_y=0):
+    def initialize_template(self, template, origin_x=0, origin_y=0):
+        logger.info("initializing template in {} ".format(self))
+        template_id = template.component_id
         url = self.url + self.endpoints['initialize_template']
         data = '{"templateId":"' + template_id + '","originX":'+str(origin_x)+',"originY":'+str(origin_y)+'}'
         response = self.nifi_connection._post(url, data)
         process_group_id = json.loads(response.text)['flow']['processGroups'][0]['id']
-        return process_group_id
+        return ProcessGroup(self.nifi_connection, process_group_id)
 
 
 class Template(NifiComponent):
@@ -201,9 +221,15 @@ class Template(NifiComponent):
         self.endpoints['download'] = "download"
 
     def download(self):
+        logger.info("downloading {}".format(self))
         url = self.url + self.endpoints['download']
         response = self.nifi_connection._get(url)
         return response.text
+
+    def delete(self):
+        logger.info("deleting {}".format(self))
+        url = self.url
+        requests.delete(url)
 
 
 class Processor(NifiComponent):
@@ -227,10 +253,10 @@ class Processor(NifiComponent):
 
     def disable(self):
         logger.info("disabling {}".format(self))
-
         self.nifi_connection.change_state(self.url, "DISABLED", "RUNNING")
 
     def restart(self):
+        logger.info("restarting {}".format(self))
         self.stop()
         time.sleep(5)
         self.start()
@@ -243,10 +269,15 @@ class ControllerService(NifiComponent):
     def __init__(self, nifi_connection, controller_service_id):
         NifiComponent.__init__(self, nifi_connection, controller_service_id)
 
+    def get_name(self):
+        url = self.url
+        response = self.nifi_connection._get(url)
+        cs_name = json.loads(response.text)['component']['name']
+        logger.info("name of {} is {}".format(self, cs_name))
+        return cs_name
 
     def get_referencing_components(self):
         return self.nifi_connection.get_referencing_components(self.url)
- 
 
     def stop_referencing_components(self):
         [ component.stop() for component in self.get_referencing_components() ]
@@ -263,6 +294,7 @@ class ControllerService(NifiComponent):
         self.nifi_connection.change_state(self.url, "DISABLED")
 
     def restart(self):
+        logger.info("restarting {}".format(self))
         self.stop_referencing_components()
         time.sleep(5)
         self.disable()
@@ -270,3 +302,12 @@ class ControllerService(NifiComponent):
         self.enable()
         time.sleep(5)
         self.start_referencing_components()
+
+    def update_property(self, property, value):
+        logger.info("updating {}, set property {} to value {} ".format(self, property, value))
+        url = self.url
+        response = self.nifi_connection._get(url)
+        controller_service = json.loads(response.text)
+        controller_service["component"]["properties"][property] = value
+        response = self.nifi_connection._put(url, json.dumps(controller_service))
+        return response
